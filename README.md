@@ -1,98 +1,110 @@
-# .NET Analyzer and Version Finder
+# .NET Analyzer PowerShell Scripts
 
-This repository contains tools to identify and analyze .NET components on Windows systems.
+This repository contains PowerShell scripts for detecting and analyzing .NET components on a Windows system.
 
-## DotNetVersionFinder.ps1 (Recommended)
+## Available Scripts
 
-This is an all-in-one PowerShell script that efficiently detects .NET versions and their locations on your system.
+### 1. DotNetFinder.ps1 (Recommended)
 
-### Features
+A consolidated, all-in-one script that focuses on simplicity and efficiency. This script directly finds all .NET versions installed on your system, including their locations, and works without requiring any additional files.
 
-- Detects installed .NET SDKs and runtimes using both dotnet CLI and filesystem checks
-- Identifies .NET Framework versions from registry
-- Scans running processes for .NET usage
-- Analyzes running services for .NET components
-- Examines scheduled tasks for .NET executables
-- Exports results to CSV files for further analysis
-- Provides detailed summary of findings
+**Features:**
+- Identifies .NET Framework, .NET Core, and .NET 5+ versions
+- Uses the `dotnet` CLI for additional SDK detection
+- Finds .NET components in running processes, services, and scheduled tasks
+- Provides a simple summary grouped by .NET type
+- Exports results to a CSV file
 
-### Usage
+### 2. DotNetAnalyzer.ps1 (Advanced, Modular)
+
+A more comprehensive, modular script system that provides detailed analysis of all .NET components with additional metadata. This approach requires all module files to be present.
+
+**Features:**
+- More detailed analysis with numerous data points about each component
+- Modular design that can be extended with new detection capabilities
+- Thorough reporting in multiple formats (CSV, JSON, TEXT)
+- Advanced filtering and customization options
+
+### 3. FindNETVersions.ps1 & DotNet_Simple_Analyzer.ps1 (Legacy)
+
+The original scripts that were the foundation for the current versions. Kept for reference.
+
+## Quick Start
+
+### For most users (simple, efficient approach):
 
 ```powershell
-# Basic usage - scans everything
-.\DotNetVersionFinder.ps1
+# Download and run the single-file DotNetFinder script
+.\DotNetFinder.ps1
 
-# Quick scan with less detail
-.\DotNetVersionFinder.ps1 -Quick
+# Run with output to a specific file
+.\DotNetFinder.ps1 -OutputFile "C:\Reports\dotnet_results.csv"
 
-# Skip specific components
-.\DotNetVersionFinder.ps1 -SkipProcesses -SkipTasks
+# Perform a quicker scan (skips some detailed analysis)
+.\DotNetFinder.ps1 -QuickScan
 
-# Exclude system components
-.\DotNetVersionFinder.ps1 -NoSystemItems
-
-# Specify custom output path
-.\DotNetVersionFinder.ps1 -OutputPath "C:\Reports\DotNetScan"
-
-# Show help
-.\DotNetVersionFinder.ps1 -Help
+# Skip specific component types
+.\DotNetFinder.ps1 -SkipProcesses -SkipServices
 ```
 
-### Output
+### For detailed analysis (requires all module files):
 
-The script creates a timestamped folder (by default in your TEMP directory) containing:
+```powershell
+# Download all files and run the analyzer
+.\DotNetAnalyzer.ps1
 
-- **DotNet_SDKs.csv** - Installed .NET SDKs
-- **DotNet_Core_Runtimes.csv** - Installed .NET Core/.NET 5+ runtimes
-- **DotNet_Framework_Versions.csv** - Installed .NET Framework versions
-- **DotNet_Processes.csv** - Running processes using .NET
-- **DotNet_Services.csv** - Services using .NET
-- **DotNet_Tasks.csv** - Scheduled tasks using .NET
-- **DotNetScan.log** - Detailed execution log
+# Run with specific options
+.\DotNetAnalyzer.ps1 -QuickScan -NoSystemComponents -Format JSON
+```
 
-## Other Tools in this Repository
+## DotNetFinder.ps1 Parameters
 
-This repository also includes a modular version of the analyzer with more detailed output capabilities. It consists of:
-
-- **DotNetAnalyzer.ps1** - Main script that coordinates module loading and execution
-- **modules/** - Directory containing specialized modules:
-  - **Framework.ps1** - .NET Framework detection
-  - **Core.ps1** - .NET Core/.NET 5+ detection
-  - **Process.ps1** - Process analysis module
-  - **Service.ps1** - Service analysis module
-  - **Task.ps1** - Scheduled tasks analysis module
-  - **Utils.ps1** - Common utilities and functions
-
-For most users, the **DotNetVersionFinder.ps1** script is recommended for its simplicity and ease of use.
+- `OutputFile` - Specify a file path for CSV output
+- `QuickScan` - Perform a faster analysis with less detail
+- `SkipProcesses` - Don't analyze running processes
+- `SkipServices` - Don't analyze system services
+- `SkipTasks` - Don't analyze scheduled tasks
 
 ## Requirements
 
 - Windows operating system
 - PowerShell 5.0 or higher
-- Administrative privileges (for complete analysis of services and processes)
+- Administrative privileges (for complete service and process analysis)
+
+## Output Example
+
+The DotNetFinder script provides a summary like this:
+
+```
+=========== .NET COMPONENT SUMMARY ===========
+Found 37 .NET components on this system
+
+.NET Core/.NET (12 components)
+  - 6.0.22
+  - 7.0.11
+  - 8.0.0
+
+.NET Framework (8 components)
+  - 4.8
+  - 4.7.2
+  - 3.5 SP1
+
+.NET SDK (5 components)
+  - 6.0.417
+  - 7.0.401
+  - 8.0.101
+...
+```
+
+A detailed CSV is also generated with all components and their locations.
 
 ## Notes
 
-- For full functionality, run with administrative privileges
-- Analysis of a complete system may take several minutes
-- The tool does not modify any system components
+- Some processes and services may require administrative privileges to analyze
+- The script only analyzes services that are currently running by default
+- Only enabled scheduled tasks are analyzed by default
+- Analysis of large systems may take several minutes to complete
 
-## Examples
+## License
 
-### Finding .NET SDK versions (similar to `dotnet --list-sdks`)
-
-```powershell
-.\DotNetVersionFinder.ps1 -SkipProcesses -SkipServices -SkipTasks
-```
-
-### Analyzing only user applications (no system components)
-
-```powershell
-.\DotNetVersionFinder.ps1 -NoSystemItems -OutputPath "C:\Temp\DotNetUserApps"
-```
-
-### Quick scan of everything
-
-```powershell
-.\DotNetVersionFinder.ps1 -Quick
-```
+This project is licensed under the MIT License.
