@@ -1,640 +1,497 @@
 # DotNetVersionFinder.ps1
-# All-in-one script to detect .NET versions on Windows systems
-# Identifies .NET Framework, .NET Core, and .NET 5+ across processes, services, and tasks
+# Scans the system for all .NET versions and lists files organized by version
+# Provides a clear outline to identify applications that need updating
 
 param(
     [Parameter(Mandatory=$false)]
-    [switch]$Quick,            # Quick scan with less detail
+    [string]$OutputFile = "",
     
     [Parameter(Mandatory=$false)]
-    [switch]$SkipProcesses,    # Skip process scanning
+    [switch]$ExportAsHTML,
     
     [Parameter(Mandatory=$false)]
-    [switch]$SkipServices,     # Skip service scanning
+    [switch]$SkipSystemComponents,
     
     [Parameter(Mandatory=$false)]
-    [switch]$SkipTasks,        # Skip scheduled tasks scanning
+    [switch]$IncludeServerComponents,
     
     [Parameter(Mandatory=$false)]
-    [switch]$NoSystemItems,    # Skip system processes/services/tasks
-    
-    [Parameter(Mandatory=$false)]
-    [string]$OutputPath = ""   # Custom output path
+    [switch]$IncludeASPNET
 )
 
-# Set up log file and results directory
+# Initialize
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-if ([string]::IsNullOrEmpty($OutputPath)) {
-    $resultsDir = Join-Path $env:TEMP "DotNetScan_$timestamp"
-} else {
-    $resultsDir = $OutputPath
-}
+$LogFile = "$env:TEMP\DotNetVersionFinder_$timestamp.log"
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$dotNetComponents = @{}
+$systemPaths = @("$env:windir\Microsoft.NET", "$env:windir\assembly", "$env:windir\System32", "$env:windir\SysWOW64")
 
-if (-not (Test-Path $resultsDir)) {
-    New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null
-}
+# Start logging
+"[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] .NET Version Finder Started" | Out-File -FilePath $LogFile
 
-$logFile = Join-Path $resultsDir "DotNetScan.log"
-"[$timestamp] .NET Version Finder Started" | Out-File -FilePath $logFile
-
-# Logging function
+# Helper functions
 function Write-Log {
-    param (
-        [string]$Message,
-        [string]$Level = "INFO"
-    )
+    param($Message, $Level = "INFO")
     
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $logMessage = "[$timestamp] [$Level] $Message"
+    "$timestamp [$Level] $Message" | Out-File -FilePath $LogFile -Append
     
-    # Write to log file
-    $logMessage | Out-File -FilePath $logFile -Append
-    
-    # Write to console with color
     switch ($Level) {
-        "INFO"    { Write-Host $logMessage -ForegroundColor White }
-        "WARNING" { Write-Host $logMessage -ForegroundColor Yellow }
-        "ERROR"   { Write-Host $logMessage -ForegroundColor Red }
-        "SUCCESS" { Write-Host $logMessage -ForegroundColor Green }
-        "DETAIL"  { Write-Host $logMessage -ForegroundColor Gray }
+        "ERROR"   { Write-Host $Message -ForegroundColor Red }
+        "WARNING" { Write-Host $Message -ForegroundColor Yellow }
+        "SUCCESS" { Write-Host $Message -ForegroundColor Green }
+        default   { Write-Host $Message }
     }
 }
 
-function Export-Results {
-    param (
-        [Array]$Data,
-        [string]$FileName
+function Get-FileDotNetVersion {
+    param([string]$FilePath)
+    
+    $dotNetVersion = $null
+    
+    try {
+        if (Test-Path $FilePath) {
+            # Check for PE header with .NET CLI header
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($FilePath)
+                
+                # Basic PE header check
+                if ($bytes.Length -gt 64 -and $bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
+                    $peOffset = [BitConverter]::ToInt32($bytes, 60)
+                    
+                    if ($peOffset -gt 0 -and $peOffset -lt ($bytes.Length - 4)) {
+                        if ($bytes[$peOffset] -eq 0x50 -and $bytes[$peOffset+1] -eq 0x45) {
+                            # Check for .NET metadata
+                            $optionalHeaderOffset = $peOffset + 0x18
+                            $peFormat = $bytes[$optionalHeaderOffset + 2]
+                            $comDescriptorOffset = 0
+                            
+                            if ($peFormat -eq 0x10B) { # PE32
+                                $comDescriptorOffset = $optionalHeaderOffset + 0x60
+                            } elseif ($peFormat -eq 0x20B) { # PE32+ (64-bit)
+                                $comDescriptorOffset = $optionalHeaderOffset + 0x70
+                            }
+                            
+                            if ($comDescriptorOffset -gt 0 -and $comDescriptorOffset + 8 -lt $bytes.Length) {
+                                $comDescriptorRVA = [BitConverter]::ToInt32($bytes, $comDescriptorOffset)
+                                $comDescriptorSize = [BitConverter]::ToInt32($bytes, $comDescriptorOffset + 4)
+                                
+                                if ($comDescriptorRVA -gt 0 -and $comDescriptorSize -gt 0) {
+                                    # It's a .NET assembly!
+                                    try {
+                                        $assembly = [System.Reflection.Assembly]::LoadFile($FilePath)
+                                        
+                                        # Check for target framework attribute
+                                        $targetFrameworkAttribute = $assembly.GetCustomAttributes([System.Runtime.Versioning.TargetFrameworkAttribute], $false)
+                                        if ($targetFrameworkAttribute -and $targetFrameworkAttribute.Length -gt 0) {
+                                            $tfm = $targetFrameworkAttribute[0].FrameworkName
+                                            
+                                            # Parse framework name
+                                            if ($tfm -match "^\.NETCoreApp,Version=v(\d+\.\d+)") {
+                                                $dotNetVersion = ".NET Core $($matches[1])"
+                                            } elseif ($tfm -match "^\.NETCore,Version=v(\d+\.\d+)") {
+                                                $dotNetVersion = ".NET Core $($matches[1])"
+                                            } elseif ($tfm -match "^\.NETFramework,Version=v(\d+\.\d+)") {
+                                                $dotNetVersion = ".NET Framework $($matches[1])"
+                                            } elseif ($tfm -match "^\.NETStandard,Version=v(\d+\.\d+)") {
+                                                $dotNetVersion = ".NET Standard $($matches[1])"
+                                            } elseif ($tfm -match "^\.NET,Version=v(\d+\.\d+)") {
+                                                $dotNetVersion = ".NET $($matches[1])"
+                                            } else {
+                                                $dotNetVersion = "$tfm"
+                                            }
+                                        } else {
+                                            # Fallback to imageruntime version
+                                            $runtimeInfo = $assembly.ImageRuntimeVersion
+                                            if ($runtimeInfo -match "^v(\d+\.\d+)") {
+                                                $version = $matches[1]
+                                                if ($version -eq "4.0") {
+                                                    $dotNetVersion = ".NET Framework 4.0"
+                                                } elseif ($version -eq "2.0") {
+                                                    $dotNetVersion = ".NET Framework 2.0"
+                                                } else {
+                                                    $dotNetVersion = ".NET Runtime v$version"
+                                                }
+                                            } else {
+                                                $dotNetVersion = "$runtimeInfo"
+                                            }
+                                        }
+                                    } catch {
+                                        # Still a .NET assembly but can't get details
+                                        $dotNetVersion = ".NET (Unknown Version)"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {
+                # File access error, silently continue
+            }
+        }
+    } catch {
+        # General error, silently continue
+    }
+    
+    return $dotNetVersion
+}
+
+function Is-SystemComponent {
+    param([string]$Path)
+    
+    # Check if the path is in one of the system folders
+    foreach ($systemPath in $systemPaths) {
+        if ($Path -like "$systemPath*") {
+            return $true
+        }
+    }
+    
+    # Check common system DLLs and executables
+    $systemFiles = @("mscorlib.dll", "System.dll", "System.*.dll", "Microsoft.*.dll")
+    $fileName = Split-Path -Leaf $Path
+    
+    foreach ($pattern in $systemFiles) {
+        if ($fileName -like $pattern) {
+            # Make exception for specific user apps that use Microsoft.* naming
+            if ($Path -like "*\Program Files*" -and -not ($Path -like "*\Windows\*")) {
+                return $false
+            }
+            return $true
+        }
+    }
+    
+    return $false
+}
+
+function Add-DotNetComponent {
+    param(
+        [string]$Version,
+        [string]$FilePath,
+        [string]$ComponentType,
+        [string]$Context = ""
     )
     
-    if (-not $Data -or $Data.Count -eq 0) {
+    # Skip if we should exclude system components
+    if ($SkipSystemComponents -and (Is-SystemComponent -Path $FilePath)) {
         return
     }
     
-    $filePath = Join-Path $resultsDir "$FileName.csv"
-    $Data | Export-Csv -Path $filePath -NoTypeInformation
-    Write-Log "Exported $($Data.Count) items to $filePath" -Level "SUCCESS"
+    # Skip ASP.NET unless specifically included
+    if (-not $IncludeASPNET -and ($Version -like "*ASP.NET*")) {
+        return
+    }
+    
+    # Skip server components unless specifically included
+    $isServerComponent = $FilePath -like "*\Windows\Microsoft.NET\Framework*\ASP.NET*" -or 
+                         $FilePath -like "*\inetpub\*" -or 
+                         $FilePath -like "*\Windows\System32\inetsrv\*"
+    
+    if (-not $IncludeServerComponents -and $isServerComponent) {
+        return
+    }
+    
+    # Create the key if it doesn't exist
+    if (-not $dotNetComponents.ContainsKey($Version)) {
+        $dotNetComponents[$Version] = @()
+    }
+    
+    # Add the component
+    $component = [PSCustomObject]@{
+        Path = $FilePath
+        Type = $ComponentType
+        Context = $Context
+    }
+    
+    # Check if this is a duplicate
+    $exists = $false
+    foreach ($item in $dotNetComponents[$Version]) {
+        if ($item.Path -eq $FilePath -and $item.Type -eq $ComponentType) {
+            $exists = $true
+            break
+        }
+    }
+    
+    if (-not $exists) {
+        $dotNetComponents[$Version] += $component
+    }
 }
 
-function IsAdministrator {
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-# Display header
-Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "                .NET VERSION FINDER                    " -ForegroundColor Cyan
-Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "System: $env:COMPUTERNAME" -ForegroundColor White
-Write-Host "Date  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor White
-Write-Host "Output: $resultsDir" -ForegroundColor White
-Write-Host "Admin : $(if(IsAdministrator) { 'Yes' } else { 'No (limited functionality)' })" -ForegroundColor White
-Write-Host "=======================================================" -ForegroundColor Cyan
+# Display banner
+Write-Host "=============================================================" -ForegroundColor Cyan
+Write-Host "                .NET VERSION FINDER                          " -ForegroundColor Cyan
+Write-Host "      Lists all .NET versions and associated files           " -ForegroundColor Cyan
+Write-Host "=============================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ==== PART 1: Check .NET CLI information ====
-# Similar to "dotnet --version" but more comprehensive
-Write-Host "Checking .NET CLI versions..." -ForegroundColor Green
-
-$dotnetSdks = @()
-$dotnetRuntimes = @()
-
-# Try directly using dotnet command
-try {
-    # Check if dotnet CLI is available
-    $dotnetPath = Get-Command dotnet -ErrorAction SilentlyContinue
-    
-    if ($dotnetPath) {
-        Write-Log "Found dotnet CLI at: $($dotnetPath.Source)"
-        
-        # Get SDK versions
-        $sdkOutput = dotnet --list-sdks 2>$null
-        if ($sdkOutput) {
-            foreach ($line in $sdkOutput) {
-                if ($line -match '(\d+\.\d+\.\d+[^ ]*) \[(.*)\]') {
-                    $version = $matches[1]
-                    $path = $matches[2]
-                    
-                    $dotnetSdks += [PSCustomObject]@{
-                        Version = $version
-                        InstallPath = $path
-                        Type = ".NET SDK"
-                    }
-                    
-                    Write-Log "Found .NET SDK $version at $path" -Level "DETAIL"
-                }
-            }
-        } else {
-            Write-Log "No .NET SDKs found using dotnet CLI" -Level "WARNING"
-        }
-        
-        # Get runtime versions
-        $runtimeOutput = dotnet --list-runtimes 2>$null
-        if ($runtimeOutput) {
-            foreach ($line in $runtimeOutput) {
-                if ($line -match '([^ ]+) (\d+\.\d+\.\d+[^ ]*) \[(.*)\]') {
-                    $type = $matches[1]
-                    $version = $matches[2]
-                    $path = $matches[3]
-                    
-                    $dotnetRuntimes += [PSCustomObject]@{
-                        Type = $type
-                        Version = $version
-                        InstallPath = $path
-                    }
-                    
-                    Write-Log "Found .NET Runtime $type $version at $path" -Level "DETAIL"
-                }
-            }
-        } else {
-            Write-Log "No .NET Runtimes found using dotnet CLI" -Level "WARNING"
-        }
-    } else {
-        Write-Log "dotnet CLI not found in PATH" -Level "WARNING"
-    }
-} catch {
-    Write-Log "Error using dotnet CLI: $($_.Exception.Message)" -Level "ERROR"
+if (-not $isAdmin) {
+    Write-Host "Note: Running without admin privileges. Some results may be limited." -ForegroundColor Yellow
+    Write-Host ""
 }
 
-# ==== PART 2: Check .NET Framework from registry ====
-Write-Host "Checking .NET Framework versions from registry..." -ForegroundColor Green
+# Find installed .NET Framework versions
+Write-Host "Checking installed .NET Framework versions..." -ForegroundColor Green
 
-$dotnetFrameworks = @()
-
-# Check for .NET Framework 1.0 and 1.1
-$netFx10 = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\.NETFramework\Policy\v1.0" -ErrorAction SilentlyContinue
-if ($netFx10) {
-    $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v1.0.3705"
-    
-    $dotnetFrameworks += [PSCustomObject]@{
-        Version = ".NET Framework 1.0"
-        ServicePack = $null
-        InstallPath = $installPath
-        Release = $null
-    }
-    
-    Write-Log "Found .NET Framework 1.0 at $installPath"
-}
-
-$netFx11 = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v1.1.4322" -ErrorAction SilentlyContinue
-if ($netFx11) {
-    $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v1.1.4322"
-    
-    $dotnetFrameworks += [PSCustomObject]@{
-        Version = ".NET Framework 1.1"
-        ServicePack = $netFx11.SP
-        InstallPath = $installPath
-        Release = $null
-    }
-    
-    Write-Log "Found .NET Framework 1.1 SP$($netFx11.SP) at $installPath"
-}
-
-# .NET Framework 2.0 to 4.x
+# From registry
 $ndpKey = "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP"
 if (Test-Path $ndpKey) {
-    # .NET Framework 2.0, 3.0, 3.5
-    foreach ($versionKey in Get-ChildItem $ndpKey | Where-Object { $_.PSChildName -match "^v[23]" }) {
-        if ($versionKey.PSChildName -eq "v3.0" -or $versionKey.PSChildName -eq "v3.5") {
-            $installPaths = @{
-                "v3.0" = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v2.0.50727"
-                "v3.5" = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v2.0.50727"
-            }
-            
-            $installed = (Get-ItemProperty -Path $versionKey.PSPath -Name Install -ErrorAction SilentlyContinue).Install
-            $sp = (Get-ItemProperty -Path $versionKey.PSPath -Name SP -ErrorAction SilentlyContinue).SP
-            
-            if ($installed -eq 1) {
-                $dotnetFrameworks += [PSCustomObject]@{
-                    Version = ".NET Framework $($versionKey.PSChildName.Substring(1))"
-                    ServicePack = $sp
-                    InstallPath = $installPaths[$versionKey.PSChildName]
-                    Release = $null
-                }
-                
-                Write-Log "Found .NET Framework $($versionKey.PSChildName.Substring(1)) SP$sp at $($installPaths[$versionKey.PSChildName])"
-            }
-        } else {
-            # Check for v2.0 specifically
-            foreach ($subkey in Get-ChildItem $versionKey.PSPath) {
-                $installed = (Get-ItemProperty -Path $subkey.PSPath -Name Install -ErrorAction SilentlyContinue).Install
-                
-                if ($installed -eq 1) {
-                    $version = (Get-ItemProperty -Path $subkey.PSPath -Name Version -ErrorAction SilentlyContinue).Version
-                    $sp = (Get-ItemProperty -Path $subkey.PSPath -Name SP -ErrorAction SilentlyContinue).SP
-                    $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v2.0.50727"
-                    
-                    $dotnetFrameworks += [PSCustomObject]@{
-                        Version = if ($version) { ".NET Framework $version" } else { ".NET Framework $($versionKey.PSChildName.Substring(1))" }
-                        ServicePack = $sp
-                        InstallPath = $installPath
-                        Release = $null
-                    }
-                    
-                    Write-Log "Found .NET Framework $version SP$sp at $installPath"
-                }
-            }
+    # .NET Framework 4.5 and later
+    $v4RegKey = "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+    if (Test-Path $v4RegKey) {
+        $release = (Get-ItemProperty $v4RegKey).Release
+        
+        $version = switch ($release) {
+            378389 { ".NET Framework 4.5" }
+            378675 { ".NET Framework 4.5.1" }
+            378758 { ".NET Framework 4.5.1" }
+            379893 { ".NET Framework 4.5.2" }
+            393295 { ".NET Framework 4.6" }
+            393297 { ".NET Framework 4.6" }
+            394254 { ".NET Framework 4.6.1" }
+            394271 { ".NET Framework 4.6.1" }
+            394802 { ".NET Framework 4.6.2" }
+            394806 { ".NET Framework 4.6.2" }
+            460798 { ".NET Framework 4.7" }
+            460805 { ".NET Framework 4.7" }
+            461308 { ".NET Framework 4.7.1" }
+            461310 { ".NET Framework 4.7.1" }
+            461808 { ".NET Framework 4.7.2" }
+            461814 { ".NET Framework 4.7.2" }
+            528040 { ".NET Framework 4.8" }
+            528049 { ".NET Framework 4.8" }
+            528209 { ".NET Framework 4.8.1" }
+            528372 { ".NET Framework 4.8.1" }
+            528449 { ".NET Framework 4.8.1" }
+            533320 { ".NET Framework 4.8.1" }
+            default { ".NET Framework 4.x (Release $release)" }
         }
+        
+        $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
+        Add-DotNetComponent -Version $version -FilePath $installPath -ComponentType "Runtime" -Context "System Installed"
+        Write-Log "Found $version at $installPath"
     }
     
-    # .NET Framework 4.0 and newer
-    $v4Key = Get-ChildItem $ndpKey | Where-Object { $_.PSChildName -eq "v4" -or $_.PSChildName -eq "v4.0" }
-    if ($v4Key) {
-        foreach ($subkey in Get-ChildItem $v4Key.PSPath) {
-            $profile = $subkey.PSChildName
-            $release = (Get-ItemProperty -Path $subkey.PSPath -Name Release -ErrorAction SilentlyContinue).Release
-            $version = (Get-ItemProperty -Path $subkey.PSPath -Name Version -ErrorAction SilentlyContinue).Version
-            $sp = (Get-ItemProperty -Path $subkey.PSPath -Name SP -ErrorAction SilentlyContinue).SP
-            $installed = (Get-ItemProperty -Path $subkey.PSPath -Name Install -ErrorAction SilentlyContinue).Install
+    # Check for .NET 3.5
+    $v35RegKey = "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5"
+    if (Test-Path $v35RegKey) {
+        $installed = (Get-ItemProperty $v35RegKey).Install
+        if ($installed -eq 1) {
+            $sp = (Get-ItemProperty $v35RegKey).SP
+            $version = ".NET Framework 3.5"
+            if ($sp -gt 0) { $version += " SP$sp" }
             
-            if ($installed -eq 1) {
-                # Map release number to detailed version
-                $dotNetVersion = switch ($release) {
-                    378389 { ".NET Framework 4.5" }
-                    378675 { ".NET Framework 4.5.1" }
-                    378758 { ".NET Framework 4.5.1" }
-                    379893 { ".NET Framework 4.5.2" }
-                    393295 { ".NET Framework 4.6" }
-                    393297 { ".NET Framework 4.6" }
-                    394254 { ".NET Framework 4.6.1" }
-                    394271 { ".NET Framework 4.6.1" }
-                    394802 { ".NET Framework 4.6.2" }
-                    394806 { ".NET Framework 4.6.2" }
-                    460798 { ".NET Framework 4.7" }
-                    460805 { ".NET Framework 4.7" }
-                    461308 { ".NET Framework 4.7.1" }
-                    461310 { ".NET Framework 4.7.1" }
-                    461808 { ".NET Framework 4.7.2" }
-                    461814 { ".NET Framework 4.7.2" }
-                    528040 { ".NET Framework 4.8" }
-                    528049 { ".NET Framework 4.8" }
-                    528209 { ".NET Framework 4.8.1" }
-                    528372 { ".NET Framework 4.8.1" }
-                    528449 { ".NET Framework 4.8.1" }
-                    533320 { ".NET Framework 4.8.1" }
-                    533325 { ".NET Framework 4.8.1" }
-                    default { ".NET Framework 4.x (Release: $release)" }
-                }
-                
-                $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
-                
-                $dotnetFrameworks += [PSCustomObject]@{
-                    Version = $dotNetVersion
-                    ServicePack = $sp
-                    InstallPath = $installPath
-                    Release = $release
-                }
-                
-                Write-Log "Found $dotNetVersion Release $release at $installPath"
-            }
+            $installPath = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory() -replace "v4.0.30319", "v2.0.50727"
+            Add-DotNetComponent -Version $version -FilePath $installPath -ComponentType "Runtime" -Context "System Installed"
+            Write-Log "Found $version at $installPath"
         }
     }
 }
 
-# ==== PART 3: Check .NET Core installed versions ====
-Write-Host "Checking .NET Core/.NET 5+ installed versions..." -ForegroundColor Green
+# Check for .NET Core and .NET 5+
+Write-Host "Checking installed .NET Core and .NET 5+ versions..." -ForegroundColor Green
 
-$dotnetCoreInstalled = @()
+# First use dotnet --info if available
+$dotnetExe = Get-Command dotnet -ErrorAction SilentlyContinue
+if ($dotnetExe) {
+    try {
+        $dotnetInfo = dotnet --info
+        
+        # Parse SDK versions
+        $sdkMatch = $dotnetInfo | Select-String -Pattern ".NET SDKs installed:" -Context 0,20
+        if ($sdkMatch) {
+            foreach ($line in $sdkMatch.Context.PostContext) {
+                if ($line -match '\s+(\d+\.\d+\.\d+)\s+\[(.+)\]') {
+                    $sdkVersion = $matches[1]
+                    $sdkPath = $matches[2]
+                    
+                    # Determine .NET version from SDK version
+                    $majorMinor = $sdkVersion -replace '(\d+\.\d+).*', '$1'
+                    $dotNetVersion = if ([double]$majorMinor -ge 5.0) {
+                        ".NET $majorMinor"
+                    } else {
+                        ".NET Core $majorMinor"
+                    }
+                    
+                    Add-DotNetComponent -Version $dotNetVersion -FilePath $sdkPath -ComponentType "SDK" -Context "System Installed"
+                    Write-Log "Found $dotNetVersion SDK $sdkVersion at $sdkPath"
+                }
+            }
+        }
+        
+        # Parse runtime versions
+        $runtimeMatch = $dotnetInfo | Select-String -Pattern ".NET runtimes installed:" -Context 0,30
+        if ($runtimeMatch) {
+            foreach ($line in $runtimeMatch.Context.PostContext) {
+                if ($line -match '\s+Microsoft\.(\w+)\.App\s+(\d+\.\d+\.\d+).*\[(.+)\]') {
+                    $runtimeType = $matches[1]
+                    $runtimeVersion = $matches[2]
+                    $runtimePath = $matches[3]
+                    
+                    # Format runtime version
+                    $majorMinor = $runtimeVersion -replace '(\d+\.\d+).*', '$1'
+                    $dotNetVersion = if ([double]$majorMinor -ge 5.0) {
+                        ".NET $majorMinor"
+                    } else {
+                        ".NET Core $majorMinor"
+                    }
+                    
+                    # Add context for special runtimes
+                    $context = "System Installed"
+                    if ($runtimeType -eq "AspNetCore") {
+                        $dotNetVersion = "ASP.NET Core $majorMinor"
+                        $context = "ASP.NET Core Runtime"
+                    } elseif ($runtimeType -eq "WindowsDesktop") {
+                        $context = "Windows Desktop Runtime"
+                    }
+                    
+                    Add-DotNetComponent -Version $dotNetVersion -FilePath $runtimePath -ComponentType "Runtime" -Context $context
+                    Write-Log "Found $dotNetVersion Runtime $runtimeVersion at $runtimePath"
+                }
+            }
+        }
+    } catch {
+        Write-Log "Error getting dotnet CLI info: $($_.Exception.Message)" -Level ERROR
+    }
+}
 
-# If we didn't already get them from CLI, check installation folders
-if ($dotnetRuntimes.Count -eq 0) {
-    # .NET Core Runtime paths
-    $runtimePaths = @(
-        (Join-Path $env:ProgramFiles "dotnet\shared\Microsoft.NETCore.App"),
-        (Join-Path ${env:ProgramFiles(x86)} "dotnet\shared\Microsoft.NETCore.App"),
-        (Join-Path $env:ProgramFiles "dotnet\shared\Microsoft.AspNetCore.App"),
-        (Join-Path ${env:ProgramFiles(x86)} "dotnet\shared\Microsoft.AspNetCore.App"),
-        (Join-Path $env:ProgramFiles "dotnet\shared\Microsoft.WindowsDesktop.App"),
-        (Join-Path ${env:ProgramFiles(x86)} "dotnet\shared\Microsoft.WindowsDesktop.App")
-    )
-    
-    foreach ($runtimePath in $runtimePaths) {
-        if (Test-Path $runtimePath) {
-            $type = switch -Wildcard ($runtimePath) {
-                "*Microsoft.AspNetCore.App*" { "ASP.NET Core Runtime" }
-                "*Microsoft.WindowsDesktop.App*" { "Windows Desktop Runtime" }
-                default { ".NET Core/.NET Runtime" }
+# Also check file system for .NET Core
+$runtimePaths = @(
+    "$env:ProgramFiles\dotnet\shared\Microsoft.NETCore.App",
+    "${env:ProgramFiles(x86)}\dotnet\shared\Microsoft.NETCore.App"
+)
+
+foreach ($path in $runtimePaths) {
+    if (Test-Path $path) {
+        Get-ChildItem -Path $path -Directory | ForEach-Object {
+            $version = $_.Name
+            $majorMinor = $version -replace '(\d+\.\d+).*', '$1'
+            $dotNetVersion = if ([double]$majorMinor -ge 5.0) {
+                ".NET $majorMinor"
+            } else {
+                ".NET Core $majorMinor"
             }
             
-            Get-ChildItem -Path $runtimePath -Directory | ForEach-Object {
-                $dotnetCoreInstalled += [PSCustomObject]@{
-                    Type = $type
-                    Version = $_.Name
-                    InstallPath = $_.FullName
-                }
-                
-                Write-Log "Found $type version $($_.Name) at $($_.FullName)"
-            }
+            Add-DotNetComponent -Version $dotNetVersion -FilePath $_.FullName -ComponentType "Runtime" -Context "System Installed"
+            Write-Log "Found $dotNetVersion Runtime $version at $($_.FullName)"
         }
     }
 }
 
-# ==== PART 4: Check .NET in running processes ====
-$dotnetProcesses = @()
-if (-not $SkipProcesses) {
-    Write-Host "Checking .NET usage in running processes..." -ForegroundColor Green
-    
-    # Function to detect .NET in a process
-    function Get-ProcessDotNetInfo {
-        param (
-            [System.Diagnostics.Process]$Process
-        )
+# Scan running processes
+Write-Host "Scanning running processes for .NET components..." -ForegroundColor Green
+
+$processes = Get-Process
+$processCount = 0
+
+foreach ($process in $processes) {
+    try {
+        # Skip if we can't access the process modules
+        if (-not $process.Modules) {
+            continue
+        }
         
-        $dotNetDetected = $false
-        $dotNetVersion = "Unknown"
-        $dotNetType = "Unknown"
+        # Check for .NET modules
+        $isDotNet = $false
+        $dotNetVersion = $null
         
-        try {
-            # Check for .NET modules
-            $netModules = @(
-                # .NET Framework
-                "mscorlib.dll", 
-                "clr.dll", 
-                "System.dll",
-                
-                # .NET Core/5+
-                "coreclr.dll",
-                "hostpolicy.dll",
-                "System.Private.CoreLib.dll"
-            )
+        # Use MainModule path if available
+        if ($process.MainModule) {
+            $mainModulePath = $process.MainModule.FileName
+            $dotNetVersion = Get-FileDotNetVersion -FilePath $mainModulePath
             
-            foreach ($module in $Process.Modules) {
-                if ($netModules -contains $module.ModuleName) {
-                    $dotNetDetected = $true
-                    $fileVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($module.FileName)
-                    
-                    # Determine version type
-                    if ($module.ModuleName -eq "mscorlib.dll" -or $module.ModuleName -eq "clr.dll") {
-                        $dotNetType = ".NET Framework"
-                        
-                        # Determine Framework version
-                        switch ($fileVersion.FileMajorPart) {
-                            2 { $dotNetVersion = ".NET Framework 2.0/3.0/3.5" }
-                            4 { 
-                                $dotNetVersion = switch ($fileVersion.FileMinorPart) {
-                                    0 { 
-                                        if ($fileVersion.FileBuildPart -eq 30319) {
-                                            if ($fileVersion.FilePrivatePart -le 1008) {
-                                                ".NET Framework 4.0 RTM"
-                                            } elseif ($fileVersion.FilePrivatePart -le 34209) {
-                                                ".NET Framework 4.5/4.5.1"
-                                            } elseif ($fileVersion.FilePrivatePart -le 36213) {
-                                                ".NET Framework 4.5.2"
-                                            } elseif ($fileVersion.FilePrivatePart -le 42259) {
-                                                ".NET Framework 4.6/4.6.2"
-                                            } elseif ($fileVersion.FilePrivatePart -le 43634) {
-                                                ".NET Framework 4.7/4.7.2" 
-                                            } else {
-                                                ".NET Framework 4.8+" 
-                                            }
-                                        } else {
-                                            ".NET Framework 4.x"
-                                        }
-                                    }
-                                    default { ".NET Framework 4.x" }
-                                }
-                            }
-                            default { ".NET Framework (version unknown)" }
-                        }
-                    } elseif ($module.ModuleName -eq "coreclr.dll" -or $module.ModuleName -eq "hostpolicy.dll" -or $module.ModuleName -eq "System.Private.CoreLib.dll") {
-                        $dotNetType = ".NET Core/.NET"
-                        
-                        if ($fileVersion.FileMajorPart -ge 5) {
-                            $dotNetVersion = ".NET $($fileVersion.FileMajorPart).x"
-                        } else {
-                            $dotNetVersion = ".NET Core $($fileVersion.FileMajorPart).$($fileVersion.FileMinorPart)"
-                        }
-                    }
-                    
-                    break
-                }
+            if ($dotNetVersion) {
+                $isDotNet = $true
+                $context = "$($process.ProcessName) (PID: $($process.Id))"
+                Add-DotNetComponent -Version $dotNetVersion -FilePath $mainModulePath -ComponentType "Process" -Context $context
+                Write-Log "Found $dotNetVersion process: $($process.ProcessName) at $mainModulePath"
+                $processCount++
             }
-        } catch {
-            # Access denied or other error
-            Write-Log "Error checking process $($Process.ProcessName) (PID: $($Process.Id)): $($_.Exception.Message)" -Level "ERROR"
         }
         
-        return [PSCustomObject]@{
-            Detected = $dotNetDetected
-            Version = $dotNetVersion
-            Type = $dotNetType
-        }
-    }
-    
-    $allProcesses = Get-Process
-    
-    # Filter system processes if requested
-    if ($NoSystemItems) {
-        $systemPaths = @(
-            "$env:SystemRoot\System32",
-            "$env:SystemRoot\SysWOW64",
-            "$env:SystemRoot\Microsoft.NET"
-        )
-        
-        $allProcesses = $allProcesses | Where-Object {
-            if ($_.Path) {
-                $inSystemDir = $false
-                foreach ($path in $systemPaths) {
-                    if ($_.Path -like "$path\*") {
-                        $inSystemDir = $true
+        # If main module doesn't have version, check others
+        if (-not $isDotNet) {
+            foreach ($module in $process.Modules) {
+                if ($module.ModuleName -eq "mscorlib.dll" -or 
+                    $module.ModuleName -eq "coreclr.dll" -or 
+                    $module.ModuleName -eq "System.Private.CoreLib.dll") {
+                    
+                    $dotNetVersion = Get-FileDotNetVersion -FilePath $module.FileName
+                    if ($dotNetVersion) {
+                        $context = "$($process.ProcessName) (PID: $($process.Id))"
+                        $modulePath = if ($process.MainModule) { $process.MainModule.FileName } else { $module.FileName }
+                        Add-DotNetComponent -Version $dotNetVersion -FilePath $modulePath -ComponentType "Process" -Context $context
+                        Write-Log "Found $dotNetVersion process (via module): $($process.ProcessName) at $modulePath"
+                        $processCount++
                         break
                     }
                 }
-                -not $inSystemDir
-            } else {
-                # If we can't determine path (needs admin), keep the process
-                $true
             }
         }
+    } catch {
+        # Skip processes we can't access
     }
-    
-    $processCount = 0
-    $totalCount = $allProcesses.Count
-    
-    foreach ($process in $allProcesses) {
-        $processCount++
-        
-        # Show progress
-        if ($processCount % 10 -eq 0) {
-            Write-Progress -Activity "Analyzing Processes" -Status "Progress: $processCount of $totalCount" -PercentComplete (($processCount / $totalCount) * 100)
-        }
-        
-        try {
-            $dotNetInfo = Get-ProcessDotNetInfo -Process $process
-            
-            if ($dotNetInfo.Detected) {
-                $dotnetProcesses += [PSCustomObject]@{
-                    Name = $process.ProcessName
-                    PID = $process.Id
-                    Path = if ($process.MainModule) { $process.MainModule.FileName } else { "Access denied" }
-                    DotNetVersion = $dotNetInfo.Version
-                    DotNetType = $dotNetInfo.Type
-                    Memory_MB = [math]::Round($process.WorkingSet / 1MB, 2)
-                }
-                
-                Write-Log "Found .NET process: $($process.ProcessName) (PID: $($process.Id)) - $($dotNetInfo.Version)"
-            }
-        } catch {
-            Write-Log "Error analyzing process $($process.ProcessName): $($_.Exception.Message)" -Level "ERROR"
-        }
-    }
-    
-    Write-Progress -Activity "Analyzing Processes" -Completed
 }
 
-# ==== PART 5: Check .NET in Services ====
-$dotnetServices = @()
-if (-not $SkipServices) {
-    Write-Host "Checking .NET usage in Windows services..." -ForegroundColor Green
-    
-    function Get-FileDotNetVersion {
-        param (
-            [string]$FilePath
-        )
+Write-Host "Found $processCount .NET processes" -ForegroundColor Gray
+
+# Scan services
+Write-Host "Scanning Windows services for .NET components..." -ForegroundColor Green
+
+$services = Get-Service | Where-Object { $_.Status -eq 'Running' }
+$serviceCount = 0
+
+foreach ($service in $services) {
+    try {
+        $serviceInfo = Get-WmiObject -Class Win32_Service -Filter "Name='$($service.Name)'" -ErrorAction SilentlyContinue
         
-        try {
-            if (Test-Path $FilePath) {
-                # Check for .NET assembly
-                try {
-                    $assembly = [System.Reflection.Assembly]::LoadFile($FilePath)
+        if ($serviceInfo -and $serviceInfo.PathName) {
+            # Extract executable path
+            $exePath = $serviceInfo.PathName -replace '^"([^"]+)".*$', '$1'
+            $exePath = $exePath -replace "^'([^']+)'.*$", '$1'
+            
+            # If it's svchost, check for DLL
+            if ($exePath -like "*\svchost.exe*") {
+                $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)\Parameters"
+                
+                if (Test-Path $registryPath) {
+                    $serviceDll = (Get-ItemProperty -Path $registryPath -Name "ServiceDll" -ErrorAction SilentlyContinue).ServiceDll
                     
-                    # Get target framework
-                    $targetFramework = $assembly.GetCustomAttributes([System.Runtime.Versioning.TargetFrameworkAttribute], $false)
-                    if ($targetFramework -and $targetFramework.Length -gt 0) {
-                        $frameworkName = $targetFramework[0].FrameworkName
+                    if ($serviceDll) {
+                        $dotNetVersion = Get-FileDotNetVersion -FilePath $serviceDll
                         
-                        if ($frameworkName -match "^\.NETCoreApp,Version=v(\d+\.\d+)") {
-                            return ".NET Core $($matches[1])"
-                        } elseif ($frameworkName -match "^\.NETFramework,Version=v(\d+\.\d+)") {
-                            return ".NET Framework $($matches[1])"
-                        } elseif ($frameworkName -match "^\.NET,Version=v(\d+\.\d+)") {
-                            return ".NET $($matches[1])"
-                        } else {
-                            return "Unknown .NET ($frameworkName)"
-                        }
-                    } else {
-                        # Try to infer from runtime version
-                        $runtimeVersion = $assembly.ImageRuntimeVersion
-                        if ($runtimeVersion -match "^v(\d+)\.(\d+)") {
-                            $major = [int]$matches[1]
-                            $minor = [int]$matches[2]
-                            
-                            if ($major -eq 4) {
-                                return ".NET Framework 4.x"
-                            } elseif ($major -eq 2) {
-                                return ".NET Framework 2.0/3.5"
-                            } else {
-                                return ".NET Runtime v$major.$minor"
-                            }
+                        if ($dotNetVersion) {
+                            $context = "$($service.Name) ($($service.DisplayName))"
+                            Add-DotNetComponent -Version $dotNetVersion -FilePath $serviceDll -ComponentType "Service" -Context $context
+                            Write-Log "Found $dotNetVersion service DLL: $($service.Name) at $serviceDll"
+                            $serviceCount++
                         }
                     }
-                    
-                    return ".NET (detected)"
-                } catch {
-                    # Not a .NET assembly or couldn't load
-                    return "Not .NET"
+                }
+            } else {
+                $dotNetVersion = Get-FileDotNetVersion -FilePath $exePath
+                
+                if ($dotNetVersion) {
+                    $context = "$($service.Name) ($($service.DisplayName))"
+                    Add-DotNetComponent -Version $dotNetVersion -FilePath $exePath -ComponentType "Service" -Context $context
+                    Write-Log "Found $dotNetVersion service: $($service.Name) at $exePath"
+                    $serviceCount++
                 }
             }
-        } catch {
-            # File not found or access denied
-            return "Error: $($_.Exception.Message)"
         }
-        
-        return "Not .NET"
+    } catch {
+        # Skip services we can't access
     }
-    
-    $allServices = Get-Service | Where-Object { $_.Status -eq 'Running' }
-    
-    # Filter system services if requested
-    if ($NoSystemItems) {
-        $systemServiceNames = @(
-            "wuauserv", "WSearch", "WinDefend", "Dhcp", "Dnscache", 
-            "LanmanServer", "LanmanWorkstation", "MSDTC", "PlugPlay", 
-            "SamSs", "Schedule", "SENS", "Spooler", "W32Time", "winmgmt"
-        )
-        
-        $allServices = $allServices | Where-Object { $systemServiceNames -notcontains $_.Name }
-    }
-    
-    $serviceCount = 0
-    $totalCount = $allServices.Count
-    
-    foreach ($service in $allServices) {
-        $serviceCount++
-        
-        # Show progress
-        if ($serviceCount % 5 -eq 0) {
-            Write-Progress -Activity "Analyzing Services" -Status "Progress: $serviceCount of $totalCount" -PercentComplete (($serviceCount / $totalCount) * 100)
-        }
-        
-        try {
-            $wmiService = Get-WmiObject -Class Win32_Service -Filter "Name='$($service.Name)'" -ErrorAction SilentlyContinue
-            
-            if ($wmiService -and $wmiService.PathName) {
-                $exePath = $wmiService.PathName -replace '^"([^"]+)".*$', '$1'
-                $exePath = $exePath -replace "^'([^']+)'.*$", '$1'
-                
-                $dotNetVersion = "Unknown"
-                
-                # Try to find process associated with service
-                $serviceProcess = Get-Process -Id $wmiService.ProcessId -ErrorAction SilentlyContinue
-                if ($serviceProcess) {
-                    # Check .NET in process
-                    $dotNetInfo = Get-ProcessDotNetInfo -Process $serviceProcess
-                    if ($dotNetInfo.Detected) {
-                        $dotNetVersion = $dotNetInfo.Version
-                    }
-                } else {
-                    # Check executable file directly
-                    $dotNetVersion = Get-FileDotNetVersion -FilePath $exePath
-                }
-                
-                # If we found .NET usage
-                if ($dotNetVersion -ne "Unknown" -and $dotNetVersion -ne "Not .NET") {
-                    $dotnetServices += [PSCustomObject]@{
-                        Name = $service.Name
-                        DisplayName = $service.DisplayName
-                        ExecutablePath = $exePath
-                        DotNetVersion = $dotNetVersion
-                        ProcessId = $wmiService.ProcessId
-                        StartMode = $wmiService.StartMode
-                        Account = $wmiService.StartName
-                    }
-                    
-                    Write-Log "Found .NET service: $($service.Name) ($($service.DisplayName)) - $dotNetVersion"
-                }
-            }
-        } catch {
-            Write-Log "Error analyzing service $($service.Name): $($_.Exception.Message)" -Level "ERROR"
-        }
-    }
-    
-    Write-Progress -Activity "Analyzing Services" -Completed
 }
 
-# ==== PART 6: Check .NET in Task Scheduler ====
-$dotnetTasks = @()
-if (-not $SkipTasks) {
-    Write-Host "Checking .NET usage in scheduled tasks..." -ForegroundColor Green
-    
-    $allTasks = Get-ScheduledTask | Where-Object { $_.State -ne "Disabled" }
-    
-    # Filter system tasks if requested
-    if ($NoSystemItems) {
-        $allTasks = $allTasks | Where-Object { $_.TaskPath -notlike "\Microsoft\Windows\*" }
-    }
-    
+Write-Host "Found $serviceCount .NET services" -ForegroundColor Gray
+
+# Scan scheduled tasks
+Write-Host "Scanning scheduled tasks for .NET components..." -ForegroundColor Green
+
+try {
+    $tasks = Get-ScheduledTask | Where-Object { $_.State -ne "Disabled" }
     $taskCount = 0
-    $totalCount = $allTasks.Count
     
-    foreach ($task in $allTasks) {
-        $taskCount++
-        
-        # Show progress
-        if ($taskCount % 10 -eq 0) {
-            Write-Progress -Activity "Analyzing Scheduled Tasks" -Status "Progress: $taskCount of $totalCount" -PercentComplete (($taskCount / $totalCount) * 100)
-        }
-        
+    foreach ($task in $tasks) {
         try {
             $actions = $task.Actions
             
@@ -648,185 +505,302 @@ if (-not $SkipTasks) {
                     try {
                         $exePath = [System.Environment]::ExpandEnvironmentVariables($exePath)
                     } catch {
-                        Write-Log "Error expanding environment variables in path: $exePath" -Level "ERROR"
+                        # Skip environment variable expansion if it fails
                     }
                     
                     if (Test-Path $exePath -ErrorAction SilentlyContinue) {
                         $dotNetVersion = Get-FileDotNetVersion -FilePath $exePath
                         
-                        if ($dotNetVersion -ne "Not .NET") {
-                            # Get RunAs information
-                            $runAsUser = "Unknown"
-                            try {
-                                $taskXml = [xml]$task.XML
-                                $principal = $taskXml.Task.Principals.Principal
-                                if ($principal) {
-                                    $runAsUser = $principal.UserId
-                                    if (-not $runAsUser) {
-                                        if ($principal.GroupId) {
-                                            $runAsUser = $principal.GroupId
-                                        } else {
-                                            $runAsUser = if ($principal.RunLevel -eq "HighestAvailable") { "Elevated Rights" } else { "Standard User" }
-                                        }
-                                    }
-                                }
-                            } catch {
-                                Write-Log "Error getting task details for $($task.TaskName): $($_.Exception.Message)" -Level "ERROR"
-                            }
-                            
-                            $dotnetTasks += [PSCustomObject]@{
-                                TaskName = $task.TaskName
-                                TaskPath = $task.TaskPath
-                                ExecutablePath = $exePath
-                                DotNetVersion = $dotNetVersion
-                                RunAsUser = $runAsUser
-                                State = $task.State
-                                Arguments = $action.Arguments
-                            }
-                            
-                            Write-Log "Found .NET task: $($task.TaskName) - $dotNetVersion"
+                        if ($dotNetVersion) {
+                            $context = "$($task.TaskPath)$($task.TaskName)"
+                            Add-DotNetComponent -Version $dotNetVersion -FilePath $exePath -ComponentType "Scheduled Task" -Context $context
+                            Write-Log "Found $dotNetVersion scheduled task: $($task.TaskName) at $exePath"
+                            $taskCount++
                         }
                     }
                     
-                    break  # Only process the first action with an executable
+                    break  # Only check first action with executable
                 }
             }
         } catch {
-            Write-Log "Error analyzing task $($task.TaskName): $($_.Exception.Message)" -Level "ERROR"
+            # Skip tasks we can't access
         }
     }
     
-    Write-Progress -Activity "Analyzing Scheduled Tasks" -Completed
+    Write-Host "Found $taskCount .NET scheduled tasks" -ForegroundColor Gray
+} catch {
+    Write-Log "Error scanning scheduled tasks: $($_.Exception.Message)" -Level ERROR
 }
 
-# ==== PART 7: Export Results ====
-Write-Host "`nExporting results to CSV files..." -ForegroundColor Green
+# Scan installed applications 
+Write-Host "Scanning installed applications for .NET components..." -ForegroundColor Green
 
-# Combine Core and Standard installations to a complete picture
-$allDotNetCore = $dotnetRuntimes
-if ($dotnetCoreInstalled.Count -gt 0) {
-    foreach ($core in $dotnetCoreInstalled) {
-        # Only add if not already in the list
-        if (-not ($allDotNetCore | Where-Object { $_.Version -eq $core.Version -and $_.Type -eq $core.Type })) {
-            $allDotNetCore += $core
-        }
-    }
-}
+$appPaths = @(
+    "${env:ProgramFiles}\",
+    "${env:ProgramFiles(x86)}\"
+)
 
-Export-Results -Data $dotnetSdks -FileName "DotNet_SDKs"
-Export-Results -Data $allDotNetCore -FileName "DotNet_Core_Runtimes"
-Export-Results -Data $dotnetFrameworks -FileName "DotNet_Framework_Versions"
-Export-Results -Data $dotnetProcesses -FileName "DotNet_Processes"
-Export-Results -Data $dotnetServices -FileName "DotNet_Services"
-Export-Results -Data $dotnetTasks -FileName "DotNet_Tasks"
+$appCount = 0
+$scannedFiles = @{}
 
-# ==== PART 8: Display Summary ====
-Write-Host "`n=======================================================" -ForegroundColor Cyan
-Write-Host "               SUMMARY REPORT                         " -ForegroundColor Cyan
-Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host ""
-
-# Framework summary
-Write-Host "INSTALLED .NET FRAMEWORK VERSIONS:" -ForegroundColor Green
-if ($dotnetFrameworks.Count -gt 0) {
-    $dotnetFrameworks | ForEach-Object {
-        $versionDesc = $_.Version
-        if ($_.ServicePack) { $versionDesc += " SP$($_.ServicePack)" }
+foreach ($basePath in $appPaths) {
+    if (Test-Path $basePath) {
+        # Get top-level directories first
+        $appDirs = Get-ChildItem -Path $basePath -Directory -ErrorAction SilentlyContinue
         
-        Write-Host "  - $versionDesc" -ForegroundColor White
-        Write-Host "    Path: $($_.InstallPath)" -ForegroundColor Gray
+        foreach ($appDir in $appDirs) {
+            # Skip certain system directories to avoid long scans
+            if ($appDir.Name -in @("Windows", "WindowsApps", "Microsoft", "Common Files")) {
+                continue
+            }
+            
+            # Get executable files
+            $exeFiles = Get-ChildItem -Path $appDir.FullName -Include "*.exe", "*.dll" -Recurse -ErrorAction SilentlyContinue -Depth 2
+            
+            foreach ($file in $exeFiles) {
+                # Skip if we've already scanned this file
+                if ($scannedFiles.ContainsKey($file.FullName)) {
+                    continue
+                }
+                
+                $scannedFiles[$file.FullName] = $true
+                
+                $dotNetVersion = Get-FileDotNetVersion -FilePath $file.FullName
+                
+                if ($dotNetVersion) {
+                    $context = "Installed App: $($appDir.Name)"
+                    Add-DotNetComponent -Version $dotNetVersion -FilePath $file.FullName -ComponentType "Application" -Context $context
+                    Write-Log "Found $dotNetVersion application: $($file.Name) at $($file.FullName)"
+                    $appCount++
+                }
+            }
+        }
     }
-} else {
-    Write-Host "  No .NET Framework installations detected" -ForegroundColor Yellow
 }
+
+Write-Host "Found $appCount .NET applications" -ForegroundColor Gray
+
+# Sort and organize results
+Write-Host ""
+Write-Host "Organizing results..." -ForegroundColor Green
+
+# Sort versions by framework type and version number
+$sortedVersions = $dotNetComponents.Keys | ForEach-Object {
+    $framework = $_
+    $versionStr = if ($framework -match '([\d\.]+)') { $matches[1] } else { "0.0" }
+    
+    $priority = switch -Wildcard ($framework) {
+        ".NET 6*"              { 1 }
+        ".NET 5*"              { 2 }
+        ".NET Core 3*"         { 3 }
+        ".NET Core 2*"         { 4 }
+        ".NET Core*"           { 5 }
+        ".NET Framework 4.8*"  { 6 }
+        ".NET Framework 4.7*"  { 7 }
+        ".NET Framework 4.6*"  { 8 }
+        ".NET Framework 4.5*"  { 9 }
+        ".NET Framework 4*"    { 10 }
+        ".NET Framework 3.5*"  { 11 }
+        ".NET Framework*"      { 12 }
+        "ASP.NET Core*"        { 13 }
+        ".NET Standard*"       { 14 }
+        default                { 99 }
+    }
+    
+    [PSCustomObject]@{
+        Version = $framework
+        SortKey = $priority
+        VersionNum = $versionStr
+    }
+} | Sort-Object -Property SortKey, VersionNum
+
+# Display results
+Write-Host ""
+Write-Host "============ .NET VERSIONS SUMMARY ============" -ForegroundColor Cyan
+Write-Host "Found $($dotNetComponents.Count) .NET versions" -ForegroundColor Cyan
 Write-Host ""
 
-# Core summary
-Write-Host "INSTALLED .NET CORE/.NET VERSIONS:" -ForegroundColor Green
-if ($allDotNetCore.Count -gt 0) {
-    $runtimeTypeGroups = $allDotNetCore | Group-Object -Property Type
-    foreach ($group in $runtimeTypeGroups) {
+foreach ($versionInfo in $sortedVersions) {
+    $version = $versionInfo.Version
+    $components = $dotNetComponents[$version]
+    
+    # Skip if no components (shouldn't happen, but just in case)
+    if ($components.Count -eq 0) {
+        continue
+    }
+    
+    # Get icon based on framework
+    $icon = switch -Wildcard ($version) {
+        ".NET 6*"             { "🔷" }
+        ".NET 5*"             { "🔷" }
+        ".NET Core*"          { "🔶" }
+        ".NET Framework 4.8*" { "🔴" }
+        ".NET Framework*"     { "🔴" }
+        "ASP.NET Core*"       { "🔶" }
+        ".NET Standard*"      { "⚪" }
+        default               { "📦" }
+    }
+    
+    # Determine color
+    $color = switch -Wildcard ($version) {
+        ".NET 6*"             { "Green" }
+        ".NET 5*"             { "Green" }
+        ".NET Core*"          { "Yellow" }
+        ".NET Framework 4.8*" { "White" }
+        ".NET Framework*"     { "Red" }
+        "ASP.NET Core*"       { "Yellow" }
+        ".NET Standard*"      { "Gray" }
+        default               { "Cyan" }
+    }
+    
+    # Display framework version
+    Write-Host "$icon $version ($($components.Count) components)" -ForegroundColor $color
+    
+    # Group components by type for better organization
+    $groupedComponents = $components | Group-Object -Property Type
+    
+    foreach ($group in $groupedComponents) {
         Write-Host "  $($group.Name):" -ForegroundColor White
-        $sortedVersions = $group.Group | Sort-Object Version -Descending
-        foreach ($version in $sortedVersions) {
-            Write-Host "    - $($version.Version)" -ForegroundColor White
-            Write-Host "      Path: $($version.InstallPath)" -ForegroundColor Gray
+        
+        # Sort by context and path
+        $sortedComponents = $group.Group | Sort-Object -Property Context, Path
+        
+        foreach ($component in $sortedComponents) {
+            Write-Host "    - $($component.Path)" -ForegroundColor Gray
+            Write-Host "      $($component.Context)" -ForegroundColor DarkGray
         }
     }
-} else {
-    Write-Host "  No .NET Core/.NET installations detected" -ForegroundColor Yellow
+    
+    Write-Host ""
 }
-Write-Host ""
 
-# SDK summary
-Write-Host ".NET SDK VERSIONS:" -ForegroundColor Green
-if ($dotnetSdks.Count -gt 0) {
-    $sortedSdks = $dotnetSdks | Sort-Object Version -Descending
-    foreach ($sdk in $sortedSdks) {
-        Write-Host "  - $($sdk.Version)" -ForegroundColor White
-        Write-Host "    Path: $($sdk.InstallPath)" -ForegroundColor Gray
-    }
-} else {
-    Write-Host "  No .NET SDKs detected" -ForegroundColor Yellow
-}
-Write-Host ""
-
-# Process summary
-if (-not $SkipProcesses) {
-    Write-Host ".NET PROCESSES:" -ForegroundColor Green
-    if ($dotnetProcesses.Count -gt 0) {
-        $runtimeTypeGroups = $dotnetProcesses | Group-Object -Property DotNetType
-        foreach ($group in $runtimeTypeGroups) {
-            Write-Host "  $($group.Name) ($($group.Group.Count) processes):" -ForegroundColor White
-            
-            # Show top memory consumers first
-            $topProcesses = $group.Group | Sort-Object Memory_MB -Descending | Select-Object -First 5
-            foreach ($process in $topProcesses) {
-                Write-Host "    - $($process.Name) (PID: $($process.PID))" -ForegroundColor White
-                Write-Host "      Version: $($process.DotNetVersion)" -ForegroundColor Gray
-                Write-Host "      Memory: $($process.Memory_MB) MB" -ForegroundColor Gray
-            }
-            
-            if ($group.Group.Count -gt 5) {
-                Write-Host "    - ... and $($group.Group.Count - 5) more" -ForegroundColor Gray
+# Export results
+if ($OutputFile -ne "") {
+    try {
+        # Prepare output data
+        $exportData = @()
+        
+        foreach ($version in $dotNetComponents.Keys) {
+            foreach ($component in $dotNetComponents[$version]) {
+                $exportData += [PSCustomObject]@{
+                    DotNetVersion = $version
+                    FilePath = $component.Path
+                    ComponentType = $component.Type
+                    Context = $component.Context
+                }
             }
         }
-    } else {
-        Write-Host "  No .NET processes detected" -ForegroundColor Yellow
-    }
-    Write-Host ""
-}
-
-# Service summary
-if (-not $SkipServices) {
-    Write-Host ".NET SERVICES:" -ForegroundColor Green
-    if ($dotnetServices.Count -gt 0) {
-        foreach ($service in $dotnetServices) {
-            Write-Host "  - $($service.Name) ($($service.DisplayName))" -ForegroundColor White
-            Write-Host "    Version: $($service.DotNetVersion)" -ForegroundColor Gray
-            Write-Host "    Path: $($service.ExecutablePath)" -ForegroundColor Gray
+        
+        # Determine export format and file
+        if ($ExportAsHTML) {
+            $htmlFile = if ($OutputFile -like "*.html") { $OutputFile } else { "$OutputFile.html" }
+            
+            # Create HTML content
+            $htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>.NET Version Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        h2 { color: #0066cc; margin-top: 20px; }
+        .version-group { margin-bottom: 20px; }
+        .component-type { margin-left: 20px; margin-top: 10px; font-weight: bold; }
+        .component-item { margin-left: 40px; margin-bottom: 5px; }
+        .component-path { color: #333; }
+        .component-context { color: #666; font-size: 0.9em; margin-left: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th { background-color: #0066cc; color: white; padding: 8px; text-align: left; }
+        td { border: 1px solid #ddd; padding: 8px; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>.NET Version Report</h1>
+    <p>Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+    <p>Found $($dotNetComponents.Count) .NET versions on system: $env:COMPUTERNAME</p>
+    
+    <h2>Summary Table</h2>
+    <table>
+        <tr>
+            <th>.NET Version</th>
+            <th>Component Count</th>
+        </tr>
+"@
+            
+            foreach ($versionInfo in $sortedVersions) {
+                $version = $versionInfo.Version
+                $components = $dotNetComponents[$version]
+                $htmlContent += "        <tr><td>$version</td><td>$($components.Count)</td></tr>`n"
+            }
+            
+            $htmlContent += "    </table>`n`n    <h2>Detailed Component List</h2>`n"
+            
+            foreach ($versionInfo in $sortedVersions) {
+                $version = $versionInfo.Version
+                $components = $dotNetComponents[$version]
+                
+                $htmlContent += "    <div class='version-group'>`n"
+                $htmlContent += "        <h3>$version ($($components.Count) components)</h3>`n"
+                
+                $groupedComponents = $components | Group-Object -Property Type
+                
+                foreach ($group in $groupedComponents) {
+                    $htmlContent += "        <div class='component-type'>$($group.Name):</div>`n"
+                    
+                    $sortedComponents = $group.Group | Sort-Object -Property Context, Path
+                    
+                    foreach ($component in $sortedComponents) {
+                        $htmlContent += "        <div class='component-item'>`n"
+                        $htmlContent += "            <div class='component-path'>$($component.Path)</div>`n"
+                        $htmlContent += "            <div class='component-context'>$($component.Context)</div>`n"
+                        $htmlContent += "        </div>`n"
+                    }
+                }
+                
+                $htmlContent += "    </div>`n"
+            }
+            
+            $htmlContent += @"
+</body>
+</html>
+"@
+            
+            $htmlContent | Out-File -FilePath $htmlFile -Encoding UTF8
+            Write-Host "Results exported to HTML: $htmlFile" -ForegroundColor Green
+            
+        } else {
+            # CSV export
+            $csvFile = if ($OutputFile -like "*.csv") { $OutputFile } else { "$OutputFile.csv" }
+            $exportData | Export-Csv -Path $csvFile -NoTypeInformation
+            Write-Host "Results exported to CSV: $csvFile" -ForegroundColor Green
         }
-    } else {
-        Write-Host "  No .NET services detected" -ForegroundColor Yellow
+    } catch {
+        Write-Log "Error exporting results: $($_.Exception.Message)" -Level ERROR
     }
-    Write-Host ""
-}
-
-# Task summary
-if (-not $SkipTasks) {
-    Write-Host ".NET SCHEDULED TASKS:" -ForegroundColor Green
-    if ($dotnetTasks.Count -gt 0) {
-        foreach ($task in $dotnetTasks) {
-            Write-Host "  - $($task.TaskName)" -ForegroundColor White
-            Write-Host "    Version: $($task.DotNetVersion)" -ForegroundColor Gray
-            Write-Host "    Path: $($task.ExecutablePath)" -ForegroundColor Gray
+} else {
+    # Default output in temp dir
+    $defaultOutput = "$env:TEMP\DotNetVersions_$timestamp.csv"
+    
+    # Prepare output data
+    $exportData = @()
+    
+    foreach ($version in $dotNetComponents.Keys) {
+        foreach ($component in $dotNetComponents[$version]) {
+            $exportData += [PSCustomObject]@{
+                DotNetVersion = $version
+                FilePath = $component.Path
+                ComponentType = $component.Type
+                Context = $component.Context
+            }
         }
-    } else {
-        Write-Host "  No .NET scheduled tasks detected" -ForegroundColor Yellow
     }
-    Write-Host ""
+    
+    $exportData | Export-Csv -Path $defaultOutput -NoTypeInformation
+    Write-Host "Results exported to CSV: $defaultOutput" -ForegroundColor Green
 }
 
-Write-Host "=======================================================" -ForegroundColor Cyan
-Write-Host "Results have been saved to: $resultsDir" -ForegroundColor Green
-Write-Host "=======================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Analysis complete! Log file: $LogFile" -ForegroundColor Cyan
+Write-Host "=============================================================" -ForegroundColor Cyan
